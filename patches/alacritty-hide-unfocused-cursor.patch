@@ -1,0 +1,61 @@
+diff --git a/alacritty/src/config/cursor.rs b/alacritty/src/config/cursor.rs
+--- a/alacritty/src/config/cursor.rs
++++ b/alacritty/src/config/cursor.rs
+@@ -19,6 +19,7 @@
+     pub style: ConfigCursorStyle,
+     pub vi_mode_style: Option<ConfigCursorStyle>,
+     pub unfocused_hollow: bool,
++    pub hide_when_unfocused: bool,
+
+     thickness: Percentage,
+     blink_interval: u64,
+@@ -30,6 +31,7 @@
+         Self {
+             thickness: Percentage::new(0.15),
+             unfocused_hollow: true,
++            hide_when_unfocused: false,
+             blink_interval: 750,
+             blink_timeout: 5,
+             style: Default::default(),
+diff --git a/alacritty/src/display/content.rs b/alacritty/src/display/content.rs
+--- a/alacritty/src/display/content.rs
++++ b/alacritty/src/display/content.rs
+@@ -51,6 +51,7 @@
+         // Find terminal cursor shape.
+         let cursor_shape = if terminal_content.cursor.shape == CursorShape::Hidden
+             || display.cursor_hidden
++            || (!term.is_focused && config.cursor.hide_when_unfocused)
+             || search_state.regex().is_some()
+             || display.ime.preedit().is_some()
+         {
+diff --git a/extra/man/alacritty.5.scd b/extra/man/alacritty.5.scd
+--- a/extra/man/alacritty.5.scd
++++ b/extra/man/alacritty.5.scd
+@@ -584,6 +584,12 @@
+ 	Specifying _0_ will disable timeout for blinking.
+
+ 	Default: _5_
++
++*hide_when_unfocused* = _true_ | _false_
++
++	Hide the terminal cursor when the window is not focused.
++
++	Default: _false_
+
+ *unfocused_hollow* = _true_ | _false_
+
+diff --git a/alacritty/src/event.rs b/alacritty/src/event.rs
+--- a/alacritty/src/event.rs
++++ b/alacritty/src/event.rs
+@@ -1985,8 +1985,9 @@
+                     WindowEvent::Focused(is_focused) => {
+                         self.ctx.terminal.is_focused = is_focused;
+
+-                        // When the unfocused hollow is used we must redraw on focus change.
+-                        if self.ctx.config.cursor.unfocused_hollow {
++                        if self.ctx.config.cursor.unfocused_hollow
++                            || self.ctx.config.cursor.hide_when_unfocused
++                        {
+                             *self.ctx.dirty = true;
+                         }
+

@@ -1,0 +1,155 @@
+diff --git a/alacritty/src/event.rs b/alacritty/src/event.rs
+index 46ecdad..f36f030 100644
+--- a/alacritty/src/event.rs
++++ b/alacritty/src/event.rs
+@@ -1865,6 +1865,9 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
+                     self.ctx.display.pending_update.dirty = true;
+                 },
+                 EventType::Terminal(event) => match event {
++                    TerminalEvent::PtyWrite(_) | TerminalEvent::ColorRequest(..)
++                    | TerminalEvent::TextAreaSizeRequest(_)
++                        if std::env::var_os("AMUX_STATE_STREAM").is_some() => (),
+                     TerminalEvent::Title(title) => {
+                         if !self.ctx.preserve_title && self.ctx.config.window.dynamic_title {
+                             self.ctx.window().set_title(title);
+diff --git a/alacritty_terminal/Cargo.toml b/alacritty_terminal/Cargo.toml
+index 96bd274..cc3a261 100644
+--- a/alacritty_terminal/Cargo.toml
++++ b/alacritty_terminal/Cargo.toml
+@@ -15,6 +15,7 @@ default = ["serde"]
+ serde = ["dep:serde", "bitflags/serde", "vte/serde"]
+ 
+ [dependencies]
++serde_json = "1.0.0"
+ base64 = "0.22.0"
+ bitflags = "2.4.1"
+ home = "0.5.5"
+@@ -44,5 +45,6 @@ windows-sys = { version = "0.59.0", features = [
+     "Win32_System_WindowsProgramming",
+ ]}
+ 
+-[dev-dependencies]
+-serde_json = "1.0.0"
++[[bin]]
++name = "amux-terminal-state"
++path = "src/bin/amux-terminal-state.rs"
+diff --git a/alacritty_terminal/src/event_loop.rs b/alacritty_terminal/src/event_loop.rs
+index 9b55cb5..8702f2a 100644
+--- a/alacritty_terminal/src/event_loop.rs
++++ b/alacritty_terminal/src/event_loop.rs
+@@ -151,7 +151,11 @@ where
+             }
+ 
+             // Parse the incoming bytes.
+-            state.parser.advance(&mut **terminal, &buf[..unprocessed]);
++            if let Some(frames) = &mut state.frames {
++                frames.advance(&mut **terminal, &mut state.parser, &buf[..unprocessed])?;
++            } else {
++                state.parser.advance(&mut **terminal, &buf[..unprocessed]);
++            }
+ 
+             processed += unprocessed;
+             unprocessed = 0;
+@@ -205,6 +209,9 @@ where
+     pub fn spawn(mut self) -> JoinHandle<(Self, State)> {
+         thread::spawn_named("PTY reader", move || {
+             let mut state = State::default();
++            if std::env::var_os("AMUX_STATE_STREAM").is_some() {
++                state.frames = Some(Default::default());
++            }
+             let mut buf = [0u8; READ_BUFFER_SIZE];
+ 
+             let poll_opts = PollMode::Level;
+@@ -402,6 +409,7 @@ pub struct State {
+     write_list: VecDeque<Cow<'static, [u8]>>,
+     writing: Option<Writing>,
+     parser: ansi::Processor,
++    frames: Option<crate::term::checkpoint::Frames>,
+ }
+ 
+ impl State {
+diff --git a/alacritty_terminal/src/grid/mod.rs b/alacritty_terminal/src/grid/mod.rs
+index 4e394d9..6c8a01e 100644
+--- a/alacritty_terminal/src/grid/mod.rs
++++ b/alacritty_terminal/src/grid/mod.rs
+@@ -31,6 +31,7 @@ pub trait GridCell: Sized {
+ }
+ 
+ #[derive(Debug, Default, Clone, PartialEq, Eq)]
++#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+ pub struct Cursor<T> {
+     /// The location of this cursor.
+     pub point: Point,
+@@ -53,6 +54,7 @@ pub struct Cursor<T> {
+ }
+ 
+ #[derive(Debug, Default, Copy, Clone, PartialEq, Eq)]
++#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+ pub struct Charsets([StandardCharset; 4]);
+ 
+ impl Index<CharsetIndex> for Charsets {
+diff --git a/alacritty_terminal/src/term/mod.rs b/alacritty_terminal/src/term/mod.rs
+index 8eb6797..749c83f 100644
+--- a/alacritty_terminal/src/term/mod.rs
++++ b/alacritty_terminal/src/term/mod.rs
+@@ -27,6 +27,7 @@ use crate::vte::ansi::{
+ };
+ 
+ pub mod cell;
++pub mod checkpoint;
+ pub mod color;
+ pub mod search;
+ 
+diff --git a/alacritty_terminal/src/grid/mod.rs b/alacritty_terminal/src/grid/mod.rs
+--- a/alacritty_terminal/src/grid/mod.rs
++++ b/alacritty_terminal/src/grid/mod.rs
+@@ -13,3 +13,4 @@
+ pub mod resize;
++pub(crate) mod checkpoint;
+ mod row;
+ mod storage;
+diff --git a/alacritty_terminal/src/grid/storage.rs b/alacritty_terminal/src/grid/storage.rs
+--- a/alacritty_terminal/src/grid/storage.rs
++++ b/alacritty_terminal/src/grid/storage.rs
+@@ -31,17 +31,17 @@
+ #[derive(Clone, Debug)]
+ #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+ pub struct Storage<T> {
+-    inner: Vec<Row<T>>,
++    pub(super) inner: Vec<Row<T>>,
+ 
+     /// Starting point for the storage of rows.
+     ///
+     /// This value represents the starting line offset within the ring buffer. The value of this
+     /// offset may be larger than the `len` itself, and will wrap around to the start to form the
+     /// ring buffer. It represents the bottommost line of the terminal.
+-    zero: usize,
++    pub(super) zero: usize,
+ 
+     /// Number of visible lines.
+-    visible_lines: usize,
++    pub(super) visible_lines: usize,
+ 
+     /// Total number of lines currently active in the terminal (scrollback + visible)
+     ///
+@@ -49,7 +49,7 @@
+     /// having to truncate the raw `inner` buffer.
+     /// As long as `len` is bigger than `inner`, it is also possible to grow the scrollback buffer
+     /// without any additional insertions.
+-    len: usize,
++    pub(super) len: usize,
+ }
+ 
+ impl<T: PartialEq> PartialEq for Storage<T> {
+diff --git a/alacritty_terminal/src/grid/row.rs b/alacritty_terminal/src/grid/row.rs
+--- a/alacritty_terminal/src/grid/row.rs
++++ b/alacritty_terminal/src/grid/row.rs
+@@ -15,7 +15,7 @@
+ #[derive(Default, Clone, Debug)]
+ #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+ pub struct Row<T> {
+-    inner: Vec<T>,
++    pub(super) inner: Vec<T>,
+ 
+     /// Maximum number of occupied entries.
+     ///

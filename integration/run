@@ -1,0 +1,8 @@
+#!/bin/sh
+set -eu
+repo=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+state=${XDG_STATE_HOME:-"$HOME/.local/state"}/amux-integration
+mkdir -p "$state"
+nix --extra-experimental-features 'nix-command flakes' build \
+    "$repo#amux-mesa" --out-link "$state/mesa"
+exec "$state/mesa/bin/amux" "$@"

@@ -1,0 +1,201 @@
+--- a/alacritty/src/renderer/text/atlas.rs
++++ b/alacritty/src/renderer/text/atlas.rs
+@@ -54,6 +54,8 @@
+     /// This is used as the advance when end of row is reached.
+     row_tallest: i32,
+ 
++    pending: Option<Vec<u8>>,
++
+     /// Gles context.
+     ///
+     /// This affects the texture loading.
+@@ -106,9 +108,38 @@
+             row_baseline: 0,
+             row_tallest: 0,
+             is_gles_context,
++            pending: None,
+         }
+     }
+ 
++    pub fn begin_bulk(&mut self) {
++        self.pending.get_or_insert_with(|| vec![0; (self.width * self.height * 4) as usize]);
++    }
++
++    pub fn finish_bulk(&mut self, active_tex: &mut GLuint) {
++        let Some(pixels) = self.pending.take() else { return };
++        let height = self.row_baseline + self.row_tallest;
++        if height == 0 {
++            return;
++        }
++        unsafe {
++            gl::BindTexture(gl::TEXTURE_2D, self.id);
++            gl::TexSubImage2D(
++                gl::TEXTURE_2D,
++                0,
++                0,
++                0,
++                self.width,
++                height,
++                gl::RGBA,
++                gl::UNSIGNED_BYTE,
++                pixels.as_ptr() as *const _,
++            );
++            gl::BindTexture(gl::TEXTURE_2D, 0);
++        }
++        *active_tex = 0;
++    }
++
+     pub fn clear(&mut self) {
+         self.row_extent = 0;
+         self.row_baseline = 0;
+@@ -151,48 +182,67 @@
+         let width = glyph.width;
+         let multicolor;
+ 
+-        unsafe {
+-            gl::BindTexture(gl::TEXTURE_2D, self.id);
+-
+-            // Load data into OpenGL.
+-            let (format, buffer) = match &glyph.buffer {
+-                BitmapBuffer::Rgb(buffer) => {
+-                    multicolor = false;
+-                    // Gles context doesn't allow uploading RGB data into RGBA texture, so need
+-                    // explicit copy.
+-                    if self.is_gles_context {
+-                        let mut new_buffer = Vec::with_capacity(buffer.len() / 3 * 4);
+-                        for rgb in buffer.chunks_exact(3) {
+-                            new_buffer.push(rgb[0]);
+-                            new_buffer.push(rgb[1]);
+-                            new_buffer.push(rgb[2]);
+-                            new_buffer.push(u8::MAX);
+-                        }
+-                        (gl::RGBA, Cow::Owned(new_buffer))
+-                    } else {
+-                        (gl::RGB, Cow::Borrowed(buffer))
++        if let Some(pixels) = self.pending.as_mut() {
++            multicolor = matches!(glyph.buffer, BitmapBuffer::Rgba(_));
++            for row in 0..height as usize {
++                for column in 0..width as usize {
++                    let source = row * width as usize + column;
++                    let target = ((offset_y as usize + row) * self.width as usize
++                        + offset_x as usize + column) * 4;
++                    match &glyph.buffer {
++                        BitmapBuffer::Rgb(buffer) => {
++                            pixels[target..target + 3]
++                                .copy_from_slice(&buffer[source * 3..source * 3 + 3]);
++                            pixels[target + 3] = u8::MAX;
++                        },
++                        BitmapBuffer::Rgba(buffer) => {
++                            pixels[target..target + 4]
++                                .copy_from_slice(&buffer[source * 4..source * 4 + 4]);
++                        },
+                     }
+-                },
+-                BitmapBuffer::Rgba(buffer) => {
+-                    multicolor = true;
+-                    (gl::RGBA, Cow::Borrowed(buffer))
+-                },
+-            };
+-
+-            gl::TexSubImage2D(
+-                gl::TEXTURE_2D,
+-                0,
+-                offset_x,
+-                offset_y,
+-                width,
+-                height,
+-                format,
+-                gl::UNSIGNED_BYTE,
+-                buffer.as_ptr() as *const _,
+-            );
+-
+-            gl::BindTexture(gl::TEXTURE_2D, 0);
+-            *active_tex = 0;
++                }
++            }
++        } else {
++            unsafe {
++                gl::BindTexture(gl::TEXTURE_2D, self.id);
++
++                let (format, buffer) = match &glyph.buffer {
++                    BitmapBuffer::Rgb(buffer) => {
++                        multicolor = false;
++                        if self.is_gles_context {
++                            let mut new_buffer = Vec::with_capacity(buffer.len() / 3 * 4);
++                            for rgb in buffer.chunks_exact(3) {
++                                new_buffer.push(rgb[0]);
++                                new_buffer.push(rgb[1]);
++                                new_buffer.push(rgb[2]);
++                                new_buffer.push(u8::MAX);
++                            }
++                            (gl::RGBA, Cow::Owned(new_buffer))
++                        } else {
++                            (gl::RGB, Cow::Borrowed(buffer))
++                        }
++                    },
++                    BitmapBuffer::Rgba(buffer) => {
++                        multicolor = true;
++                        (gl::RGBA, Cow::Borrowed(buffer))
++                    },
++                };
++
++                gl::TexSubImage2D(
++                    gl::TEXTURE_2D,
++                    0,
++                    offset_x,
++                    offset_y,
++                    width,
++                    height,
++                    format,
++                    gl::UNSIGNED_BYTE,
++                    buffer.as_ptr() as *const _,
++                );
++
++                gl::BindTexture(gl::TEXTURE_2D, 0);
++                *active_tex = 0;
++            }
+         }
+ 
+         // Update Atlas state.
+@@ -261,6 +311,7 @@
+             Err(AtlasInsertError::Full) => {
+                 // Get the context type before adding a new Atlas.
+                 let is_gles_context = atlas[*current_atlas].is_gles_context;
++                let bulk_upload = atlas[*current_atlas].pending.is_some();
+ 
+                 // Advance the current Atlas index.
+                 *current_atlas += 1;
+@@ -270,5 +321,8 @@
+                     atlas.push(new);
+                 }
++                if bulk_upload {
++                    atlas[*current_atlas].begin_bulk();
++                }
+                 Atlas::load_glyph(active_tex, atlas, current_atlas, rasterized)
+             },
+             Err(AtlasInsertError::GlyphTooLarge) => Glyph {
+--- a/alacritty/src/renderer/text/mod.rs
++++ b/alacritty/src/renderer/text/mod.rs
+@@ -188,6 +188,7 @@
+ 
+ impl LoadGlyph for LoaderApi<'_> {
+     fn load_glyph(&mut self, rasterized: &RasterizedGlyph) -> Glyph {
++        self.atlas[*self.current_atlas].begin_bulk();
+         Atlas::load_glyph(self.active_tex, self.atlas, self.current_atlas, rasterized)
+     }
+ 
+@@ -196,6 +197,14 @@
+     }
+ }
+ 
++impl Drop for LoaderApi<'_> {
++    fn drop(&mut self) {
++        for atlas in self.atlas.iter_mut() {
++            atlas.finish_bulk(self.active_tex);
++        }
++    }
++}
++
+ fn update_projection(u_projection: GLint, size: &SizeInfo) {
+     let width = size.width();
+     let height = size.height();
