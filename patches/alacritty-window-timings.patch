@@ -1,0 +1,108 @@
+diff --git a/alacritty/src/renderer/profile.rs b/alacritty/src/renderer/profile.rs
+--- /dev/null
++++ b/alacritty/src/renderer/profile.rs
+@@ -0,0 +1,30 @@
++use std::sync::OnceLock;
++use std::time::{Duration, Instant};
++
++fn cpu_time() -> Option<Duration> {
++    let mut value = libc::timespec { tv_sec: 0, tv_nsec: 0 };
++    let status = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut value) };
++    (status == 0).then(|| Duration::new(value.tv_sec as u64, value.tv_nsec as u32))
++}
++
++pub fn measure<T>(stage: &str, threshold_ms: u64, operation: impl FnOnce() -> T) -> T {
++    static ENABLED: OnceLock<bool> = OnceLock::new();
++    if !*ENABLED.get_or_init(|| std::env::var_os("AMUX_TRACE_TIMINGS").is_some()) {
++        return operation();
++    }
++
++    let cpu_start = cpu_time();
++    let start = Instant::now();
++    let result = operation();
++    let elapsed = start.elapsed();
++    let cpu = cpu_time().zip(cpu_start).map(|(end, begin)| end.saturating_sub(begin));
++    if elapsed >= Duration::from_millis(threshold_ms) {
++        log::info!(
++            "WM_TIMING stage={} wall_ms={:.3} cpu_ms={:?}",
++            stage,
++            elapsed.as_secs_f64() * 1000.,
++            cpu.map(|duration| duration.as_secs_f64() * 1000.),
++        );
++    }
++    result
++}
+diff --git a/alacritty/src/renderer/mod.rs b/alacritty/src/renderer/mod.rs
+--- a/alacritty/src/renderer/mod.rs
++++ b/alacritty/src/renderer/mod.rs
+@@ -24,6 +24,7 @@
+ use crate::renderer::shader::ShaderError;
+ 
+ pub mod platform;
++pub(crate) mod profile;
+ pub mod rects;
+ mod shader;
+ mod text;
+diff --git a/alacritty/src/display/mod.rs b/alacritty/src/display/mod.rs
+--- a/alacritty/src/display/mod.rs
++++ b/alacritty/src/display/mod.rs
+@@ -414,7 +414,9 @@
+         let font_size = config.font.size().scale(scale_factor);
+         debug!("Loading \"{}\" font", &config.font.normal().family);
+         let font = config.font.clone().with_size(font_size);
+-        let mut glyph_cache = GlyphCache::new(rasterizer, &font)?;
++        let mut glyph_cache = crate::renderer::profile::measure("font_setup", 0, || {
++            GlyphCache::new(rasterizer, &font)
++        })?;
+ 
+         let metrics = glyph_cache.font_metrics();
+         let (cell_width, cell_height) = compute_cell_size(config, &metrics);
+@@ -433,15 +435,19 @@
+         )?;
+ 
+         // Make the context current.
+-        let context = gl_context.make_current(&surface)?;
++        let context = crate::renderer::profile::measure("make_current", 0, || {
++            gl_context.make_current(&surface)
++        })?;
+ 
+         // Create renderer.
+-        let mut renderer = Renderer::new(&context, config.debug.renderer)?;
++        let mut renderer = crate::renderer::profile::measure("renderer_setup", 0, || {
++            Renderer::new(&context, config.debug.renderer)
++        })?;
+ 
+         // Load font common glyphs to accelerate rendering.
+         debug!("Filling glyph cache with common glyphs");
+-        renderer.with_loader(|mut api| {
+-            glyph_cache.reset_glyph_cache(&mut api);
++        crate::renderer::profile::measure("glyph_preload", 0, || {
++            renderer.with_loader(|mut api| glyph_cache.reset_glyph_cache(&mut api));
+         });
+ 
+         let padding = config.window.padding(window.scale_factor as f32);
+diff --git a/alacritty/src/renderer/text/glyph_cache.rs b/alacritty/src/renderer/text/glyph_cache.rs
+--- a/alacritty/src/renderer/text/glyph_cache.rs
++++ b/alacritty/src/renderer/text/glyph_cache.rs
+@@ -219,7 +219,11 @@
+                 )
+             })
+             .flatten()
+-            .map_or_else(|| self.rasterizer.get_glyph(glyph_key), Ok);
++            .map_or_else(|| {
++                crate::renderer::profile::measure("rasterize", 5, || {
++                    self.rasterizer.get_glyph(glyph_key)
++                })
++            }, Ok);
+ 
+         let glyph = match rasterized {
+             Ok(rasterized) => self.load_glyph(loader, rasterized),
+@@ -265,7 +269,7 @@
+         }
+ 
+         // Add glyph to cache.
+-        loader.load_glyph(&glyph)
++        crate::renderer::profile::measure("glyph_upload", 5, || loader.load_glyph(&glyph))
+     }
+ 
+     /// Reset currently cached data in both GL and the registry to default state.
