@@ -1,0 +1,221 @@
+diff --git i/alacritty_terminal/src/grid/mod.rs w/alacritty_terminal/src/grid/mod.rs
+index f86e804..d23fdd5 100644
+--- i/alacritty_terminal/src/grid/mod.rs
++++ w/alacritty_terminal/src/grid/mod.rs
+@@ -111,6 +111,10 @@ pub enum Scroll {
+ #[derive(Clone, Debug)]
+ #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+ pub struct Grid<T> {
++    #[cfg_attr(feature = "serde", serde(skip))]
++    pub(crate) amux_next: u64,
++    #[cfg_attr(feature = "serde", serde(skip))]
++    pub(crate) amux_epoch: u64,
+     /// Current cursor for writing data.
+     #[cfg_attr(feature = "serde", serde(skip))]
+     pub cursor: Cursor<T>,
+@@ -145,6 +149,7 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
+         Grid {
+             raw: Storage::with_capacity(lines, columns),
+             max_scroll_limit,
++            amux_next: 0, amux_epoch: 0,
+             display_offset: 0,
+             saved_cursor: Cursor::default(),
+             cursor: Cursor::default(),
+@@ -273,6 +278,7 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
+ 
+         // Only rotate the entire history if the active region starts at the top.
+         if region.start == 0 {
++            if self.max_scroll_limit > 0 { self.amux_next += positions as u64; }
+             // Create scrollback for the new lines.
+             self.increase_scroll_limit(positions);
+ 
+@@ -384,6 +390,7 @@ impl<T> Grid<T> {
+ 
+     #[inline]
+     pub fn clear_history(&mut self) {
++        self.amux_epoch += 1;
+         // Explicitly purge all lines from history.
+         self.raw.shrink_lines(self.history_size());
+ 
+@@ -465,6 +472,7 @@ impl<T> Index<Line> for Grid<T> {
+ impl<T> IndexMut<Line> for Grid<T> {
+     #[inline]
+     fn index_mut(&mut self, index: Line) -> &mut Row<T> {
++        if index.0 < 0 { self.amux_epoch += 1; }
+         &mut self.raw[index]
+     }
+ }
+diff --git i/alacritty_terminal/src/grid/resize.rs w/alacritty_terminal/src/grid/resize.rs
+index 37f9369..78cf5a8 100644
+--- i/alacritty_terminal/src/grid/resize.rs
++++ w/alacritty_terminal/src/grid/resize.rs
+@@ -16,6 +16,7 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
+         T: ResetDiscriminant<D>,
+         D: PartialEq,
+     {
++        self.amux_epoch += 1;
+         // Use empty template cell for resetting cells due to resize.
+         let template = mem::take(&mut self.cursor.template);
+ 
+@@ -33,6 +34,7 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
+ 
+         // Restore template cell.
+         self.cursor.template = template;
++        self.amux_next = self.amux_next.max(self.history_size() as u64);
+     }
+ 
+     /// Add lines to the visible area.
+diff --git i/alacritty_terminal/src/term/cell.rs w/alacritty_terminal/src/term/cell.rs
+index 484eabe..54c3e40 100644
+--- i/alacritty_terminal/src/term/cell.rs
++++ w/alacritty_terminal/src/term/cell.rs
+@@ -117,12 +117,18 @@ impl ResetDiscriminant<Color> for Cell {
+ 
+ /// Dynamically allocated cell content.
+ ///
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
++pub struct SemanticMarker { pub kind: u8, pub after: bool }
++
+ /// This storage is reserved for cell attributes which are rarely set. This allows reducing the
+ /// allocation required ahead of time for every cell, with some additional overhead when the extra
+ /// storage is actually required.
+ #[derive(Default, Debug, Clone, Eq, PartialEq)]
+ #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+ pub struct CellExtra {
++    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "Vec::is_empty"))]
++    pub(crate) amux_markers: Vec<SemanticMarker>,
+     zerowidth: Vec<char>,
+     underline_color: Option<Color>,
+     hyperlink: Option<Hyperlink>,
+@@ -153,6 +159,34 @@ impl Default for Cell {
+ }
+ 
+ impl Cell {
++    pub fn amux_markers(&self) -> &[SemanticMarker] {
++        self.extra.as_ref().map_or(&[], |extra| extra.amux_markers.as_slice())
++    }
++    pub fn amux_mark(&mut self, kind: u8, after: bool) {
++        let extra = self.extra.get_or_insert(Default::default());
++        let markers = &mut Arc::make_mut(extra).amux_markers;
++        let marker = SemanticMarker { kind, after };
++        if !markers.contains(&marker) { markers.push(marker); }
++    }
++    pub fn amux_extra_bytes(&self) -> usize {
++        self.extra.as_ref().map_or(0, |extra| {
++            std::mem::size_of::<CellExtra>() + 2 * std::mem::size_of::<usize>()
++                + extra.zerowidth.capacity() * std::mem::size_of::<char>()
++                + extra.amux_markers.capacity() * std::mem::size_of::<SemanticMarker>()
++                + extra.hyperlink.as_ref().map_or(0, |link| std::mem::size_of::<HyperlinkInner>()
++                    + 2 * std::mem::size_of::<usize>() + link.inner.id.capacity() + link.inner.uri.capacity())
++        })
++    }
++    pub fn amux_text_cell(&self) -> Self {
++        let mut cell = Cell { c: self.c, flags: self.flags & (Flags::WIDE_CHAR | Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER | Flags::WRAPLINE), ..Default::default() };
++        for c in self.zerowidth().into_iter().flatten() { cell.push_zerowidth(*c); }
++        cell
++    }
++    pub(crate) fn amux_erase(&mut self, bg: Color) {
++        let markers = self.amux_markers().to_vec();
++        *self = bg.into();
++        for marker in markers { self.amux_mark(marker.kind, marker.after); }
++    }
+     /// Zerowidth characters stored in this cell.
+     #[inline]
+     pub fn zerowidth(&self) -> Option<&[char]> {
+@@ -235,7 +264,7 @@ impl GridCell for Cell {
+                     | Flags::WIDE_CHAR_SPACER
+                     | Flags::LEADING_WIDE_CHAR_SPACER,
+             )
+-            && self.extra.as_ref().map(|extra| extra.zerowidth.is_empty()) != Some(false)
++            && self.extra.as_ref().map(|extra| extra.zerowidth.is_empty() && extra.amux_markers.is_empty()) != Some(false)
+     }
+ 
+     #[inline]
+diff --git i/alacritty_terminal/src/term/mod.rs w/alacritty_terminal/src/term/mod.rs
+index 749c83f..935278c 100644
+--- i/alacritty_terminal/src/term/mod.rs
++++ w/alacritty_terminal/src/term/mod.rs
+@@ -28,6 +28,7 @@ use crate::vte::ansi::{
+ 
+ pub mod cell;
+ pub mod checkpoint;
++pub mod history;
+ pub mod color;
+ pub mod search;
+ 
+@@ -267,6 +268,9 @@ impl TermDamageState {
+ }
+ 
+ pub struct Term<T> {
++    pub amux_history: history::Descriptor,
++    pub amux_copy_reset: u64,
++    pub(crate) amux_generation: u64,
+     /// Terminal focus controlling the cursor shape.
+     pub is_focused: bool,
+ 
+@@ -424,6 +428,7 @@ impl<T> Term<T> {
+         let damage = TermDamageState::new(num_cols, num_lines);
+ 
+         Term {
++            amux_history: Default::default(), amux_generation: 0, amux_copy_reset: 0,
+             inactive_grid,
+             scroll_region,
+             event_proxy,
+@@ -625,9 +630,10 @@ impl<T> Term<T> {
+         if line_length == self.columns()
+             && line_length.0 >= 2
+             && grid_line[line_length - 1].flags.contains(Flags::LEADING_WIDE_CHAR_SPACER)
++            && line < self.bottommost_line()
+             && include_wrapped_wide
+         {
+-            text.push(self.grid[line - 1i32][Column(0)].c);
++            text.push(self.grid[line + 1i32][Column(0)].c);
+         }
+ 
+         text
+@@ -713,6 +719,7 @@ impl<T> Term<T> {
+ 
+     /// Swap primary and alternate screen buffer.
+     pub fn swap_alt(&mut self) {
++        self.amux_generation += 1;
+         if !self.mode.contains(TermMode::ALT_SCREEN) {
+             // Set alt screen cursor to the current primary screen cursor.
+             self.inactive_grid.cursor = self.grid.cursor.clone();
+@@ -983,6 +990,7 @@ impl<T> Term<T> {
+     /// Write `c` to the cell at the cursor position.
+     #[inline(always)]
+     fn write_at_cursor(&mut self, c: char) {
++        let markers = self.grid.cursor_cell().amux_markers().to_vec();
+         let c = self.grid.cursor.charsets[self.active_charset].map(c);
+         let fg = self.grid.cursor.template.fg;
+         let bg = self.grid.cursor.template.bg;
+@@ -1016,6 +1024,7 @@ impl<T> Term<T> {
+         cursor_cell.bg = bg;
+         cursor_cell.flags = flags;
+         cursor_cell.extra = extra;
++        for marker in markers { cursor_cell.amux_mark(marker.kind, marker.after); }
+     }
+ 
+     #[inline]
+@@ -1058,6 +1067,7 @@ impl<T> Dimensions for Term<T> {
+ }
+ 
+ impl<T: EventListener> Handler for Term<T> {
++    fn semantic_marker(&mut self, kind: u8) { let after = self.grid.cursor.input_needs_wrap; self.grid.cursor_cell().amux_mark(kind, after); }
+     /// A character to be displayed.
+     #[inline(never)]
+     fn input(&mut self, c: char) {
+@@ -1533,5 +1543,5 @@ impl<T: EventListener> Handler for Term<T> {
+         self.damage.damage_line(line.0 as usize, start.0, end.0);
+         let row = &mut self.grid[line];
+         for cell in &mut row[start..end] {
+-            *cell = bg.into();
++            cell.amux_erase(bg);
+         }
+@@ -1652,4 +1662,4 @@ impl<T: EventListener> Handler for Term<T> {
+         let row = &mut self.grid[point.line];
+         for cell in &mut row[left..right] {
+-            *cell = bg.into();
++            cell.amux_erase(bg);
+         }

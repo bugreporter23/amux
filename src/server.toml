@@ -1,0 +1,2 @@
+shell = ["sh"]
+editor = ["nvim"]
