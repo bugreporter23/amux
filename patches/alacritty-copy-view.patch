@@ -1,0 +1,165 @@
+diff --git i/alacritty/src/display/mod.rs w/alacritty/src/display/mod.rs
+index 78c3a4e..ee76264 100644
+--- i/alacritty/src/display/mod.rs
++++ w/alacritty/src/display/mod.rs
+@@ -724,7 +724,7 @@ impl Display {
+             pty_resize_handle.on_resize(new_size.into());
+ 
+             // Resize terminal.
+-            terminal.resize(new_size);
++            if std::env::var_os("AMUX_STATE_STREAM").is_none() { terminal.resize(new_size); }
+ 
+             // Resize damage tracking.
+             self.damage_tracker.resize(new_size.screen_lines(), new_size.columns());
+diff --git i/alacritty/src/event.rs w/alacritty/src/event.rs
+index 0170711..513115b 100644
+--- i/alacritty/src/event.rs
++++ w/alacritty/src/event.rs
+@@ -541,6 +541,8 @@ impl From<Event> for WinitEvent<Event> {
+ /// Alacritty events.
+ #[derive(Debug, Clone)]
+ pub enum EventType {
++    AmuxHistory(u64, serde_json::Value),
++    AmuxContinue,
+     Terminal(TerminalEvent),
+     ConfigReload(PathBuf),
+     Message(Message),
+@@ -663,6 +665,7 @@ impl Default for InlineSearchState {
+ pub struct ActionContext<'a, N, T> {
+     pub notifier: &'a mut N,
+     pub terminal: &'a mut Term<T>,
++    pub amux_copy: &'a mut Option<crate::amux_copy::Controller>,
+     pub clipboard: &'a mut Clipboard,
+     pub mouse: &'a mut Mouse,
+     pub touch: &'a mut TouchPurpose,
+@@ -1841,6 +1844,8 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
+     pub fn handle_event(&mut self, event: WinitEvent<Event>) {
+         match event {
+             WinitEvent::UserEvent(Event { payload, .. }) => match payload {
++                EventType::AmuxHistory(serial, value) => { if let Some(copy) = self.ctx.amux_copy { copy.response(serial, value); } *self.ctx.dirty = true; },
++                EventType::AmuxContinue => *self.ctx.dirty = true,
+                 EventType::SearchNext => self.ctx.goto_match(None),
+                 EventType::Scroll(scroll) => self.ctx.scroll(scroll),
+                 EventType::BlinkCursor => {
+@@ -1969,9 +1974,13 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
+                         self.ctx.display.pending_update.set_dimensions(size);
+                     },
+                     WindowEvent::KeyboardInput { event, is_synthetic: false, .. } => {
+-                        self.key_input(event);
++                        if self.ctx.amux_copy.as_mut().is_some_and(|copy| copy.key(&event, self.ctx.modifiers.state(), self.ctx.terminal)) {
++                            *self.ctx.dirty = true;
++                        } else { self.key_input(event); }
+                     },
+                     WindowEvent::ModifiersChanged(modifiers) => self.modifiers_input(modifiers),
++                    WindowEvent::MouseInput { .. } | WindowEvent::MouseWheel { .. }
++                        if self.ctx.amux_copy.as_ref().is_some_and(|copy| copy.view.is_some()) => (),
+                     WindowEvent::MouseInput { state, button, .. } => {
+                         self.ctx.window().set_mouse_visible(true);
+                         self.mouse_input(state, button);
+diff --git i/alacritty/src/main.rs w/alacritty/src/main.rs
+index a21ee86..63304dd 100644
+--- i/alacritty/src/main.rs
++++ w/alacritty/src/main.rs
+@@ -33,6 +33,7 @@ mod config;
+ mod daemon;
+ mod display;
+ mod event;
++mod amux_copy;
+ mod input;
+ mod logging;
+ #[cfg(target_os = "macos")]
+diff --git i/alacritty/src/window_context.rs w/alacritty/src/window_context.rs
+index 9de6679..0b1813a 100644
+--- i/alacritty/src/window_context.rs
++++ w/alacritty/src/window_context.rs
+@@ -51,6 +51,7 @@ pub struct WindowContext {
+     pub dirty: bool,
+     event_queue: Vec<WinitEvent<Event>>,
+     terminal: Arc<FairMutex<Term<EventProxy>>>,
++    amux_copy: Option<crate::amux_copy::Controller>,
+     cursor_blink_timed_out: bool,
+     prev_bell_cmd: Option<Instant>,
+     modifiers: Modifiers,
+@@ -232,7 +233,9 @@ impl WindowContext {
+         }
+ 
+         // Create context for the Alacritty window.
++        let amux_copy = crate::amux_copy::Controller::new(options.window_identity.class.as_ref().map(|class| class.instance.as_str()), event_proxy.clone());
+         Ok(WindowContext {
++            amux_copy,
+             preserve_title,
+             terminal,
+             display,
+@@ -388,6 +391,13 @@ impl WindowContext {
+ 
+         // Redraw the window.
+         let terminal = self.terminal.lock();
++        if let Some(copy) = &mut self.amux_copy {
++            copy.synchronize(&terminal);
++            if let Some(view) = &copy.view {
++                self.display.draw(view.terminal.lock(), scheduler, &self.message_buffer, &self.config, &mut self.search_state);
++                return;
++            }
++        }
+         self.display.draw(
+             terminal,
+             scheduler,
+@@ -440,6 +450,7 @@ impl WindowContext {
+             dirty: &mut self.dirty,
+             occluded: &mut self.occluded,
+             terminal: &mut terminal,
++            amux_copy: &mut self.amux_copy,
+             #[cfg(not(windows))]
+             master_fd: self.master_fd,
+             #[cfg(not(windows))]
+@@ -458,6 +469,8 @@ impl WindowContext {
+             processor.handle_event(event);
+         }
+ 
++        if let Some(copy) = &mut self.amux_copy { self.dirty |= copy.tick(&terminal, clipboard, scheduler, self.display.window.id()); }
++
+         // Process DisplayUpdate events.
+         if self.display.pending_update.dirty {
+             Self::submit_display_update(
+diff --git i/alacritty_terminal/src/event_loop.rs w/alacritty_terminal/src/event_loop.rs
+index 32b238d..a641e49 100644
+--- i/alacritty_terminal/src/event_loop.rs
++++ w/alacritty_terminal/src/event_loop.rs
+@@ -235,7 +235,7 @@ where
+                 // Wakeup the event loop when a synchronized update timeout was reached.
+                 let handler = state.parser.sync_timeout();
+                 let timeout =
+-                    handler.sync_timeout().map(|st| st.saturating_duration_since(Instant::now()));
++                    if state.frames.is_some() { None } else { handler.sync_timeout().map(|st| st.saturating_duration_since(Instant::now())) };
+ 
+                 events.clear();
+                 if let Err(err) = self.poll.wait(&mut events, timeout) {
+@@ -249,7 +249,7 @@ where
+                 }
+ 
+                 // Handle synchronized update timeout.
+-                if events.is_empty() && self.rx.peek().is_none() {
++                if state.frames.is_none() && events.is_empty() && self.rx.peek().is_none() {
+                     state.parser.stop_sync(&mut *self.terminal.lock());
+                     self.event_proxy.send_event(Event::Wakeup);
+                     continue;
+diff --git a/alacritty_terminal/src/term/mod.rs b/alacritty_terminal/src/term/mod.rs
+--- a/alacritty_terminal/src/term/mod.rs
++++ b/alacritty_terminal/src/term/mod.rs
+@@ -29,4 +29,5 @@
+ pub mod cell;
+ pub mod checkpoint;
+ pub mod history;
++pub mod copy;
+ pub mod color;
+diff --git a/alacritty/src/scheduler.rs b/alacritty/src/scheduler.rs
+--- a/alacritty/src/scheduler.rs
++++ b/alacritty/src/scheduler.rs
+@@ -31,6 +31,7 @@
+ /// Available timer topics.
+ #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+ pub enum Topic {
++    AmuxCopy,
+     SelectionScrolling,
+     DelayedSearch,
+     BlinkCursor,
