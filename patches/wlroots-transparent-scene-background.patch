@@ -1,0 +1,91 @@
+diff --git a/include/wlr/types/wlr_scene.h b/include/wlr/types/wlr_scene.h
+--- a/include/wlr/types/wlr_scene.h
++++ b/include/wlr/types/wlr_scene.h
+@@ -237,6 +237,7 @@
+ 	} events;
+ 
+ 	struct {
++		bool transparent_background;
+ 		pixman_region32_t pending_commit_damage;
+ 
+ 		uint8_t index;
+@@ -595,6 +596,9 @@
+ void wlr_scene_output_set_position(struct wlr_scene_output *scene_output,
+ 	int lx, int ly);
+ 
++void wlr_scene_output_set_transparent_background(struct wlr_scene_output *scene_output,
++	bool enabled);
++
+ struct wlr_scene_output_state_options {
+ 	struct wlr_scene_timer *timer;
+ 
+diff --git a/types/scene/wlr_scene.c b/types/scene/wlr_scene.c
+--- a/types/scene/wlr_scene.c
++++ b/types/scene/wlr_scene.c
+@@ -1893,6 +1893,15 @@
+ 	scene_output_update_geometry(scene_output, false);
+ }
+ 
++void wlr_scene_output_set_transparent_background(struct wlr_scene_output *scene_output,
++		bool enabled) {
++	if (scene_output->transparent_background == enabled) {
++		return;
++	}
++	scene_output->transparent_background = enabled;
++	scene_output_damage_whole(scene_output);
++}
++
+ static bool scene_node_invisible(struct wlr_scene_node *node) {
+ 	if (node->type == WLR_SCENE_NODE_TREE) {
+ 		return true;
+@@ -1915,6 +1924,7 @@
+ 	bool calculate_visibility;
+ 	bool highlight_transparent_region;
+ 	bool fractional_scale;
++	bool transparent_background;
+ };
+ 
+ static bool scene_buffer_is_black_opaque(struct wlr_scene_buffer *scene_buffer) {
+@@ -1934,11 +1944,11 @@
+ 		return false;
+ 	}
+ 
+-	// While rendering, the background should always be black. If we see a
+ 	// black rect, we can ignore rendering everything under the rect, and
+ 	// unless fractional scale is used even the rect itself (to avoid running
+ 	// into issues regarding damage region expansion).
+-	if (node->type == WLR_SCENE_NODE_RECT && data->calculate_visibility &&
++	if (node->type == WLR_SCENE_NODE_RECT && !data->transparent_background &&
++			data->calculate_visibility &&
+ 			(!data->fractional_scale || data->render_list->size == 0)) {
+ 		struct wlr_scene_rect *rect = wlr_scene_rect_from_node(node);
+ 		float *black = (float[4]){ 0.f, 0.f, 0.f, 1.f };
+@@ -1949,7 +1959,8 @@
+ 	}
+ 
+ 	// Apply the same special-case to black opaque single-pixel buffers
+-	if (node->type == WLR_SCENE_NODE_BUFFER && data->calculate_visibility &&
++	if (node->type == WLR_SCENE_NODE_BUFFER && !data->transparent_background &&
++			data->calculate_visibility &&
+ 			(!data->fractional_scale || data->render_list->size == 0)) {
+ 		struct wlr_scene_buffer *scene_buffer = wlr_scene_buffer_from_node(node);
+ 
+@@ -2384,6 +2395,7 @@
+ 		.calculate_visibility = scene_output->scene->calculate_visibility,
+ 		.highlight_transparent_region = scene_output->scene->highlight_transparent_region,
+ 		.fractional_scale = floor(render_data.scale) != render_data.scale,
++		.transparent_background = scene_output->transparent_background,
+ 	};
+ 
+ 	list_con.render_list->size = 0;
+@@ -2573,7 +2585,9 @@
+ 
+ 	wlr_render_pass_add_rect(render_pass, &(struct wlr_render_rect_options){
+ 		.box = { .width = buffer->width, .height = buffer->height },
+-		.color = { .r = 0, .g = 0, .b = 0, .a = 1 },
++		.color = { .r = 0, .g = 0, .b = 0,
++			.a = scene_output->transparent_background ? 0 : 1 },
++		.blend_mode = WLR_RENDER_BLEND_MODE_NONE,
+ 		.clip = &background,
+ 	});
+ 	pixman_region32_fini(&background);

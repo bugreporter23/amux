@@ -1,0 +1,145 @@
+diff --git a/src/ansi.rs b/src/ansi.rs
+index 592266e..9272dae 100644
+--- a/src/ansi.rs
++++ b/src/ansi.rs
+@@ -241,6 +241,7 @@ fn parse_number(input: &[u8]) -> Option<u8> {
+ 
+ /// Internal state for VTE processor.
+ #[derive(Debug, Default)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ struct ProcessorState<T: Timeout> {
+     /// Last processed character for repetition.
+     preceding_char: Option<char>,
+@@ -250,6 +251,7 @@ struct ProcessorState<T: Timeout> {
+ }
+ 
+ #[derive(Debug)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ struct SyncState<T: Timeout> {
+     /// Handler for synchronized updates.
+     timeout: T,
+@@ -268,6 +270,7 @@ impl<T: Timeout> Default for SyncState<T> {
+ /// Handler.
+ #[cfg(feature = "std")]
+ #[derive(Default)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ pub struct Processor<T: Timeout = StdSyncHandler> {
+     state: ProcessorState<T>,
+     parser: crate::Parser,
+@@ -277,6 +280,7 @@ pub struct Processor<T: Timeout = StdSyncHandler> {
+ /// Handler.
+ #[cfg(not(feature = "std"))]
+ #[derive(Default)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ pub struct Processor<T: Timeout> {
+     state: ProcessorState<T>,
+     parser: crate::Parser,
+@@ -440,7 +444,9 @@ impl<'a, H: Handler + 'a, T: Timeout> Performer<'a, H, T> {
+ 
+ #[cfg(feature = "std")]
+ #[derive(Default)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ pub struct StdSyncHandler {
++    #[cfg_attr(feature = "serde", serde(with = "timeout_checkpoint"))]
+     timeout: Option<Instant>,
+ }
+ 
+@@ -736,6 +742,7 @@ bitflags! {
+     ///
+     /// [`kitty keyboard protocol']: https://sw.kovidgoyal.net/kitty/keyboard-protocol
+     #[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Hash)]
++    #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+     pub struct KeyboardModes : u8 {
+         /// No keyboard protocol mode is set.
+         const NO_MODE                 = 0b0000_0000;
+@@ -818,6 +825,7 @@ pub enum KeyboardModesApplyBehavior {
+ 
+ /// Terminal cursor configuration.
+ #[derive(Default, Debug, Eq, PartialEq, Copy, Clone, Hash)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ pub struct CursorStyle {
+     pub shape: CursorShape,
+     pub blinking: bool,
+@@ -825,6 +833,7 @@ pub struct CursorStyle {
+ 
+ /// Terminal cursor shape.
+ #[derive(Debug, Default, Eq, PartialEq, Copy, Clone, Hash)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ pub enum CursorShape {
+     /// Cursor is a block like `▒`.
+     #[default]
+@@ -1188,6 +1197,7 @@ pub enum Attr {
+ 
+ /// Identifiers which can be assigned to a graphic character set.
+ #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ pub enum CharsetIndex {
+     /// Default set, is designated as ASCII at startup.
+     #[default]
+@@ -1199,6 +1209,7 @@ pub enum CharsetIndex {
+ 
+ /// Standard or common character sets which can be designated as G0-G3.
+ #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ pub enum StandardCharset {
+     #[default]
+     Ascii,
+@@ -2456,3 +2467,16 @@ mod tests {
+         assert!((rgb1.contrast(rgb2) - 9.786_558_997_257_74).abs() < f64::EPSILON);
+     }
+ }
++
++#[cfg(all(feature = "std", feature = "serde"))]
++mod timeout_checkpoint {
++    use super::*;
++    pub fn serialize<S: serde::Serializer>(timeout: &Option<Instant>, serializer: S) -> Result<S::Ok, S::Error> {
++        let millis = timeout.map(|deadline| deadline.saturating_duration_since(Instant::now()).as_millis() as u64);
++        serde::Serialize::serialize(&millis, serializer)
++    }
++    pub fn deserialize<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<Instant>, D::Error> {
++        let millis: Option<u64> = serde::Deserialize::deserialize(deserializer)?;
++        Ok(millis.map(|millis| Instant::now() + Duration::from_millis(millis)))
++    }
++}
+diff --git a/src/lib.rs b/src/lib.rs
+index 1c69123..1709915 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -52,6 +52,7 @@ const MAX_OSC_RAW: usize = 1024;
+ /// Generic over the value for the size of the raw Operating System Command
+ /// buffer. Only used when the `std` feature is not enabled.
+ #[derive(Default)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ pub struct Parser<const OSC_RAW_BUF_SIZE: usize = MAX_OSC_RAW> {
+     state: State,
+     intermediates: [u8; MAX_INTERMEDIATES],
+@@ -730,6 +731,7 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
+ }
+ 
+ #[derive(PartialEq, Eq, Debug, Default, Copy, Clone)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ enum State {
+     CsiEntry,
+     CsiIgnore,
+diff --git a/src/params.rs b/src/params.rs
+index 967befb..cc7f6ae 100644
+--- a/src/params.rs
++++ b/src/params.rs
+@@ -5,6 +5,7 @@ use core::fmt::{self, Debug, Formatter};
+ pub(crate) const MAX_PARAMS: usize = 32;
+ 
+ #[derive(Default)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ pub struct Params {
+     /// Number of subparameters for each parameter.
+     ///
+--- a/src/ansi.rs
++++ b/src/ansi.rs
+@@ -501,0 +502 @@
++    fn semantic_marker(&mut self, _: u8) {}
+@@ -1493,0 +1495,5 @@
++            b"133" if params.len() >= 2 && params[1].len() == 1 => {
++                if matches!(params[1][0], b'A' | b'B' | b'C' | b'D') {
++                    self.handler.semantic_marker(params[1][0]);
++                }
++            },
