@@ -1,0 +1,106 @@
+--- a/alacritty/src/display/damage.rs
++++ b/alacritty/src/display/damage.rs
+@@ -3,9 +3,10 @@
+ 
+ use glutin::surface::Rect;
+ 
++use alacritty_terminal::grid::Dimensions;
+ use alacritty_terminal::index::Point;
+ use alacritty_terminal::selection::SelectionRange;
+-use alacritty_terminal::term::{LineDamageBounds, TermDamageIterator};
++use alacritty_terminal::term::{LineDamageBounds, Term, TermDamage, TermDamageIterator};
+ 
+ use crate::display::SizeInfo;
+ 
+@@ -23,6 +24,7 @@
+
+     /// The damage for the frames.
+     frames: [FrameDamage; 2],
++    copy_view: bool,
+     screen_lines: usize,
+     columns: usize,
+ }
+@@ -36,6 +38,7 @@
+             old_vi_cursor: None,
+             old_selection: None,
+             frames: Default::default(),
++            copy_view: false,
+         };
+         tracker.resize(screen_lines, columns);
+         tracker
+@@ -72,6 +75,27 @@
+         self.frame().full = true;
+     }
+ 
++    pub fn set_copy_view(&mut self, copy_view: bool) {
++        if self.copy_view == copy_view { return; }
++        self.copy_view = copy_view;
++        self.frame().mark_fully_damaged();
++        self.next_frame().mark_fully_damaged();
++    }
++
++    pub fn collect_terminal_damage<T>(&mut self, terminal: &mut Term<T>) -> bool {
++        if terminal.screen_lines() != self.screen_lines || terminal.columns() != self.columns {
++            return false;
++        }
++        match terminal.damage() {
++            TermDamage::Full => self.frame().mark_fully_damaged(),
++            TermDamage::Partial(lines) => {
++                for damage in lines { self.frame().damage_line(damage); }
++            },
++        }
++        terminal.reset_damage();
++        true
++    }
++
+     /// Damage vi cursor inside the viewport.
+     pub fn damage_vi_cursor(&mut self, mut vi_cursor: Option<Point<usize>>) {
+         mem::swap(&mut self.old_vi_cursor, &mut vi_cursor);
+--- a/alacritty/src/display/mod.rs
++++ b/alacritty/src/display/mod.rs
+@@ -32,7 +32,7 @@
+ use alacritty_terminal::selection::Selection;
+ use alacritty_terminal::term::cell::Flags;
+ use alacritty_terminal::term::{
+-    self, LineDamageBounds, MIN_COLUMNS, MIN_SCREEN_LINES, Term, TermDamage, TermMode,
++    self, LineDamageBounds, MIN_COLUMNS, MIN_SCREEN_LINES, Term, TermMode,
+ };
+ use alacritty_terminal::vte::ansi::{CursorShape, NamedColor};
+ 
+@@ -786,6 +786,8 @@
+         config: &UiConfig,
+         search_state: &mut SearchState,
+     ) {
++        if !self.damage_tracker.collect_terminal_damage(&mut terminal) { return; }
++
+         // Collect renderable content before the terminal is dropped.
+         let mut content = RenderableContent::new(config, self, &terminal, search_state);
+         let mut grid_cells = Vec::new();
+@@ -805,17 +807,6 @@
+ 
+         let vi_mode = terminal.mode().contains(TermMode::VI);
+         let vi_cursor_point = if vi_mode { Some(terminal.vi_mode_cursor.point) } else { None };
+-
+-        // Add damage from the terminal.
+-        match terminal.damage() {
+-            TermDamage::Full => self.damage_tracker.frame().mark_fully_damaged(),
+-            TermDamage::Partial(damaged_lines) => {
+-                for damage in damaged_lines {
+-                    self.damage_tracker.frame().damage_line(damage);
+-                }
+-            },
+-        }
+-        terminal.reset_damage();
+ 
+         // Drop terminal as early as possible to free lock.
+         drop(terminal);
+--- a/alacritty/src/window_context.rs
++++ b/alacritty/src/window_context.rs
+@@ -393,6 +393,7 @@
+         let terminal = self.terminal.lock();
+         if let Some(copy) = &mut self.amux_copy {
+             copy.synchronize(&terminal);
++            self.display.damage_tracker.set_copy_view(copy.view.is_some());
+             if let Some(view) = &copy.view {
+                 self.display.draw(view.terminal.lock(), scheduler, &self.message_buffer, &self.config, &mut self.search_state);
+                 return;
